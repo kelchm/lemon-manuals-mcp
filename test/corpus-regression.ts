@@ -5,8 +5,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ManualSearchIndex, repairTreePath } from "../src/manual.js";
-import { fetchPage } from "../src/page.js";
+import { fetchImage, fetchPage, parseImageDimensions } from "../src/page.js";
 import { VehicleIndex, normalize } from "../src/vehicles.js";
+
+// J518 door-handle track diagram: the corpus is image-only for wiring diagrams,
+// so this pins the whole image path against silent truncation or re-encoding.
+const CANARY_IMAGE_PATH = "/images/IMP66Q313/euro600/891404313/";
+const CANARY_IMAGE_BYTE_LENGTH = 22_388;
+const CANARY_IMAGE_WIDTH = 1584;
+const CANARY_IMAGE_HEIGHT = 2000;
+
+const J518_ROOT =
+  "/Volkswagen/2005/Touareg%20%287LA%29%20V8-4.2L%20%28BHX%29/";
 
 const baseUrl = process.env["LEMON_BASE_URL"] ?? "http://127.0.0.1:18080";
 const dataDir = process.env["LEMON_DATA_DIR"] ?? join(import.meta.dir, "..", "data");
@@ -35,7 +45,10 @@ try {
   for (const [label, root] of samples) {
     assert(complete.has(root), `${label} fixture is no longer isComplete`);
     const tree = await fetchPage(baseUrl, repairTreePath(root), Number.MAX_SAFE_INTEGER);
+    // Match the indexer's filter. Without the breadcrumb check this picks LEMON's
+    // "View \"full tree\"..." navigation link, which is deliberately not indexed.
     const leaf = tree.links.find((link) =>
+      link.title && link.breadcrumb.length > 0 &&
       link.childCount === 0 && normalize(link.title).split(/\s+/).some((word) => word.length >= 4));
     assert(leaf, `${label} has no searchable leaf`);
     const query = normalize(leaf.title).split(/\s+/).find((word) => word.length >= 4);
@@ -44,6 +57,51 @@ try {
     assert(results.length > 0, `${label} title search returned no results for ${query}`);
     console.log(`${label}: ${results.length} result(s) for ${query}`);
   }
+
+  // J518 applicability ordering on the known Touareg root.
+  const j518 = await searchIndex.search(baseUrl, J518_ROOT, "J518", 50, "title");
+  assert(j518.length > 0, "J518 title search returned no results");
+  const firstFalse = j518.findIndex(
+    (hit) => hit.applicability?.appliesToVehicleYear === false,
+  );
+  let lastTrueOrNull = -1;
+  for (let i = j518.length - 1; i >= 0; i--) {
+    if (j518[i]?.applicability?.appliesToVehicleYear !== false) {
+      lastTrueOrNull = i;
+      break;
+    }
+  }
+  if (firstFalse !== -1 && lastTrueOrNull !== -1) {
+    assert(
+      firstFalse > lastTrueOrNull,
+      "appliesToVehicleYear:true must rank above false for J518",
+    );
+  }
+  console.log(`J518 ordering: ${j518.length} hit(s) on ${J518_ROOT}`);
+
+  // Canary image dimensions (skipped until constants are pinned from a live run).
+  if (CANARY_IMAGE_BYTE_LENGTH > 0) {
+    const image = await fetchImage(baseUrl, CANARY_IMAGE_PATH);
+    const bytes = Buffer.from(image.data, "base64");
+    assert.equal(bytes.byteLength, CANARY_IMAGE_BYTE_LENGTH);
+    const dims = parseImageDimensions(bytes, image.mimeType);
+    assert(dims && dims.width === CANARY_IMAGE_WIDTH && dims.height === CANARY_IMAGE_HEIGHT);
+    console.log(
+      `canary image: ${bytes.byteLength} bytes ${dims.width}x${dims.height}`,
+    );
+  } else {
+    console.log("canary image: skipped (TODO constants not pinned yet)");
+  }
+
+  // Nonexistent image returns a clean text error path via PublicError.
+  await assert.rejects(
+    () => fetchImage(baseUrl, "/images/does-not-exist/missing.png"),
+    (error: unknown) =>
+      error instanceof Error &&
+      /unavailable|could not/i.test(error.message) &&
+      !/svc\.cluster|127\.0\.0\.1:18080/.test(error.message),
+  );
+  console.log("missing image: clean PublicError");
 } finally {
   searchIndex.close();
   rmSync(temporary, { recursive: true });

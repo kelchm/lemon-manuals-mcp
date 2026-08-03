@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { PublicError, errorDetail } from "./errors.js";
-import { fetchDocumentPage, fetchPage, type PageLink } from "./page.js";
+import { fetchDocumentPage, fetchTreeLinks, type PageLink } from "./page.js";
 import { normalize } from "./vehicles.js";
 
 const REPAIR_TREE_SEGMENT = "Repair%20and%20Diagnosis/";
 const BODY_FETCH_CONCURRENCY = 8;
+/** Bump when columns/FTS shape change; mismatched stores are dropped and rebuilt. */
+const SCHEMA_VERSION = 2;
+const SNIPPET_MAX_CHARS = 205;
+/** bm25 is lower-is-better; subtract these to promote title/code matches in body mode. */
+const TITLE_TOKEN_BOOST = 20;
+const COMPONENT_CODE_BOOST = 10;
+const COMPONENT_CODE_RE = /^[a-z]{1,2}\d{1,4}[a-z]?$/;
 
 export type ManualSearchMode = "title" | "body" | "both";
 
@@ -32,6 +39,8 @@ interface DocumentRow {
   path: string;
   breadcrumb: string;
   body_text: string;
+  snippet_text: string;
+  image_count: number;
   image_only: number;
   body_indexed: number;
   child_count: number;
@@ -44,6 +53,13 @@ interface DocumentRow {
 interface IndexState {
   titles_indexed: number;
   bodies_indexed: number;
+}
+
+interface IndexedFields {
+  bodyText: string;
+  snippetText: string;
+  imageOnly: boolean;
+  imageCount: number;
 }
 
 function appendSegment(root: string, segment: string): string {
@@ -69,8 +85,50 @@ function ftsQuery(query: string, mode: ManualSearchMode): string {
   return terms;
 }
 
-function markdownBody(markdown: string, title: string): string {
-  let text = markdown
+/**
+ * Rewrite publisher cross-reference markup to plain inner text. References come
+ * both bracketed ("--> \[ Door Lock \]", whose target may wrap across lines) and
+ * bare ("--> Owner's Manual"); Turndown also escapes the leading hyphen to "\-->".
+ */
+export function stripCrossReferences(text: string): string {
+  return text
+    .replace(/\\?-->\s*\\?\[\s*([\s\S]+?)\s*\\?\]/g, "$1")
+    .replace(/\\?-->\s*/g, "")
+    .replace(/\\([\[\]])/g, "$1");
+}
+
+function tokenSet(value: string): Set<string> {
+  return new Set(normalize(value).split(/\s+/).filter(Boolean));
+}
+
+/** Jaccard similarity of two token sets: |intersection| / |union|. */
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  let intersection = 0;
+  for (const token of a) {
+    if (b.has(token)) intersection += 1;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Drop ATX headings that are near-equal to the page title (Jaccard ≥ 0.8).
+ * Avoids treating real section labels like "Removal" under "Removal and
+ * Installation" as title chrome.
+ */
+export function suppressTitleHeadings(markdown: string, title: string): string {
+  const titleTokens = tokenSet(title);
+  if (titleTokens.size === 0) return markdown;
+  return markdown.replace(/^(#{1,6})\s+(.+)$/gm, (line, _hashes: string, text: string) => {
+    const headingTokens = tokenSet(text);
+    if (headingTokens.size === 0) return line;
+    return jaccardSimilarity(headingTokens, titleTokens) >= 0.8 ? "" : line;
+  });
+}
+
+function flattenMarkdown(markdown: string): string {
+  return stripCrossReferences(markdown)
     .replace(/!\[[^\]]*\]\(<[^>]+>(?:\s+"[^"]*")?\)/g, " ")
     .replace(/\[([^\]]+)\]\(<[^>]+>(?:\s+"[^"]*")?\)/g, "$1")
     .replace(/```[\s\S]*?```/g, " ")
@@ -79,21 +137,42 @@ function markdownBody(markdown: string, title: string): string {
     .replace(/[`_*~|]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  const normalizedTitle = title.replace(/\s+/g, " ").trim();
-  if (normalizedTitle && text.toLowerCase().startsWith(normalizedTitle.toLowerCase())) {
-    text = text.slice(normalizedTitle.length).replace(/^\s*[-:–—]?\s*/, "");
-  }
-  return text;
 }
 
-function snippet(body: string, imageOnly: boolean): string {
-  if (!body) {
-    return imageOnly
-      ? "[Image-only page; no searchable text.]"
-      : "[No page body text is available.]";
-  }
+function imageOnlySnippet(imageCount: number): string {
+  return imageCount === 1
+    ? "[image only — 1 image]"
+    : `[image only — ${imageCount} images]`;
+}
+
+function clipSnippet(body: string): string {
   const points = [...body];
-  return points.length <= 200 ? body : `${points.slice(0, 200).join("")}…`;
+  return points.length <= SNIPPET_MAX_CHARS
+    ? body
+    : `${points.slice(0, SNIPPET_MAX_CHARS).join("")}…`;
+}
+
+/** Split indexed body text from the display snippet (heading-suppressed prose). */
+export function extractIndexedFields(
+  markdown: string,
+  title: string,
+  imagePaths: string[],
+): IndexedFields {
+  const cleaned = stripCrossReferences(markdown);
+  // Full searchable text keeps title-like headings so body-mode FTS still hits them.
+  const bodyText = flattenMarkdown(cleaned);
+  const prose = flattenMarkdown(suppressTitleHeadings(cleaned, title));
+  const imageCount = imagePaths.length;
+  const imageOnly = prose.length === 0 && imageCount > 0;
+  let snippetText: string;
+  if (imageOnly) {
+    snippetText = imageOnlySnippet(imageCount);
+  } else if (!prose) {
+    snippetText = "[No page body text is available.]";
+  } else {
+    snippetText = clipSnippet(prose);
+  }
+  return { bodyText, snippetText, imageOnly, imageCount };
 }
 
 function contentHash(body: string, imagePaths: string[]): string {
@@ -153,6 +232,23 @@ function appliesToYear(
   return true;
 }
 
+/** Promote body-mode hits whose title covers the query (bm25 title weight is unused). */
+export function bodyModeScoreBoost(title: string, query: string): number {
+  const queryTokens = normalize(query).split(/\s+/).filter(Boolean);
+  if (queryTokens.length === 0) return 0;
+  const titleTokens = tokenSet(title);
+  let boost = 0;
+  if (queryTokens.every((token) => titleTokens.has(token))) {
+    boost += TITLE_TOKEN_BOOST;
+  }
+  for (const token of queryTokens) {
+    if (COMPONENT_CODE_RE.test(token) && titleTokens.has(token)) {
+      boost += COMPONENT_CODE_BOOST;
+    }
+  }
+  return boost;
+}
+
 async function mapConcurrent<T>(
   values: T[],
   concurrency: number,
@@ -171,57 +267,92 @@ async function mapConcurrent<T>(
   );
 }
 
+function yieldMacrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export class ManualSearchIndex {
   readonly db: Database;
+  private readonly inflight = new Map<string, Promise<void>>();
 
   constructor(path = ":memory:") {
     this.db = new Database(path, { create: true });
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS manual_index_state (
-        vehicle_root TEXT PRIMARY KEY,
-        titles_indexed INTEGER NOT NULL DEFAULT 0,
-        bodies_indexed INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS manual_documents (
-        id INTEGER PRIMARY KEY,
-        vehicle_root TEXT NOT NULL,
-        title TEXT NOT NULL,
-        path TEXT NOT NULL,
-        breadcrumb TEXT NOT NULL,
-        body_text TEXT NOT NULL DEFAULT '',
-        image_only INTEGER NOT NULL DEFAULT 0,
-        body_indexed INTEGER NOT NULL DEFAULT 0,
-        child_count INTEGER NOT NULL DEFAULT 0,
-        content_hash TEXT,
-        applicable_from TEXT,
-        applicable_through TEXT,
-        fetch_error TEXT,
-        UNIQUE(vehicle_root, path)
-      );
-      CREATE INDEX IF NOT EXISTS manual_documents_root_hash
-        ON manual_documents(vehicle_root, content_hash);
-      CREATE VIRTUAL TABLE IF NOT EXISTS manual_documents_fts USING fts5(
-        title, breadcrumb, body_text,
-        content='manual_documents', content_rowid='id',
-        tokenize='unicode61 remove_diacritics 2'
-      );
-      CREATE TRIGGER IF NOT EXISTS manual_documents_ai AFTER INSERT ON manual_documents BEGIN
-        INSERT INTO manual_documents_fts(rowid, title, breadcrumb, body_text)
-        VALUES (new.id, new.title, new.breadcrumb, new.body_text);
-      END;
-      CREATE TRIGGER IF NOT EXISTS manual_documents_ad AFTER DELETE ON manual_documents BEGIN
-        INSERT INTO manual_documents_fts(manual_documents_fts, rowid, title, breadcrumb, body_text)
-        VALUES ('delete', old.id, old.title, old.breadcrumb, old.body_text);
-      END;
-      CREATE TRIGGER IF NOT EXISTS manual_documents_au AFTER UPDATE ON manual_documents BEGIN
-        INSERT INTO manual_documents_fts(manual_documents_fts, rowid, title, breadcrumb, body_text)
-        VALUES ('delete', old.id, old.title, old.breadcrumb, old.body_text);
-        INSERT INTO manual_documents_fts(rowid, title, breadcrumb, body_text)
-        VALUES (new.id, new.title, new.breadcrumb, new.body_text);
-      END;
-    `);
+    this.ensureSchema();
+  }
+
+  private ensureSchema(): void {
+    const row = this.db.query("PRAGMA user_version").get() as
+      | { user_version: number }
+      | null;
+    const version = row?.user_version ?? 0;
+    const migrate = version !== SCHEMA_VERSION;
+    // Drop + create + user_version must be atomic so a crash cannot leave a
+    // content table without FTS triggers while user_version still reads current.
+    // journal_mode stays outside (not transactional in SQLite).
+    this.db.transaction(() => {
+      if (migrate) {
+        // Rebuildable cache: drop the whole store when the code expects a new shape.
+        this.db.exec(`
+          DROP TRIGGER IF EXISTS manual_documents_ai;
+          DROP TRIGGER IF EXISTS manual_documents_ad;
+          DROP TRIGGER IF EXISTS manual_documents_au;
+          DROP TABLE IF EXISTS manual_documents_fts;
+          DROP TABLE IF EXISTS manual_documents;
+          DROP TABLE IF EXISTS manual_index_state;
+        `);
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS manual_index_state (
+          vehicle_root TEXT PRIMARY KEY,
+          titles_indexed INTEGER NOT NULL DEFAULT 0,
+          bodies_indexed INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS manual_documents (
+          id INTEGER PRIMARY KEY,
+          vehicle_root TEXT NOT NULL,
+          title TEXT NOT NULL,
+          path TEXT NOT NULL,
+          breadcrumb TEXT NOT NULL,
+          body_text TEXT NOT NULL DEFAULT '',
+          snippet_text TEXT NOT NULL DEFAULT '',
+          image_count INTEGER NOT NULL DEFAULT 0,
+          image_only INTEGER NOT NULL DEFAULT 0,
+          body_indexed INTEGER NOT NULL DEFAULT 0,
+          child_count INTEGER NOT NULL DEFAULT 0,
+          content_hash TEXT,
+          applicable_from TEXT,
+          applicable_through TEXT,
+          fetch_error TEXT,
+          UNIQUE(vehicle_root, path)
+        );
+        CREATE INDEX IF NOT EXISTS manual_documents_root_hash
+          ON manual_documents(vehicle_root, content_hash);
+        CREATE VIRTUAL TABLE IF NOT EXISTS manual_documents_fts USING fts5(
+          title, breadcrumb, body_text,
+          content='manual_documents', content_rowid='id',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER IF NOT EXISTS manual_documents_ai AFTER INSERT ON manual_documents BEGIN
+          INSERT INTO manual_documents_fts(rowid, title, breadcrumb, body_text)
+          VALUES (new.id, new.title, new.breadcrumb, new.body_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS manual_documents_ad AFTER DELETE ON manual_documents BEGIN
+          INSERT INTO manual_documents_fts(manual_documents_fts, rowid, title, breadcrumb, body_text)
+          VALUES ('delete', old.id, old.title, old.breadcrumb, old.body_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS manual_documents_au AFTER UPDATE ON manual_documents BEGIN
+          INSERT INTO manual_documents_fts(manual_documents_fts, rowid, title, breadcrumb, body_text)
+          VALUES ('delete', old.id, old.title, old.breadcrumb, old.body_text);
+          INSERT INTO manual_documents_fts(rowid, title, breadcrumb, body_text)
+          VALUES (new.id, new.title, new.breadcrumb, new.body_text);
+        END;
+      `);
+      if (migrate) {
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      }
+    })();
   }
 
   close(): void {
@@ -236,84 +367,96 @@ export class ManualSearchIndex {
       .get(vehicleRoot) as IndexState | null;
   }
 
+  /** Share one in-flight job per key; clear on settle (success or rejection). */
+  private runExclusive(key: string, work: () => Promise<void>): Promise<void> {
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const promise = work().finally(() => {
+      this.inflight.delete(key);
+    });
+    this.inflight.set(key, promise);
+    return promise;
+  }
+
   private async ensureTitles(baseUrl: string, vehicleRoot: string): Promise<void> {
     if (this.state(vehicleRoot)?.titles_indexed) return;
+    await this.runExclusive(`titles:${vehicleRoot}`, async () => {
+      if (this.state(vehicleRoot)?.titles_indexed) return;
 
-    let links: PageLink[];
-    try {
-      const tree = await fetchPage(
-        baseUrl,
-        repairTreePath(vehicleRoot),
-        Number.MAX_SAFE_INTEGER,
-      );
-      links = tree.links.filter(
-        (link) => link.title && link.breadcrumb.length > 0,
-      );
-    } catch (cause) {
-      throw new PublicError(
-        "Title search is unavailable for this manual.",
-        `Could not index ${repairTreePath(vehicleRoot)}: ${errorDetail(cause)}`,
-        { cause },
-      );
-    }
-    if (links.length === 0) {
-      throw new PublicError(
-        "Title search is unavailable for this manual.",
-        `Repair tree ${repairTreePath(vehicleRoot)} returned no indexable links`,
-      );
-    }
-
-    const insert = this.db.prepare(`
-      INSERT INTO manual_documents (
-        vehicle_root, title, path, breadcrumb, child_count,
-        applicable_from, applicable_through
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(vehicle_root, path) DO UPDATE SET
-        title=excluded.title, breadcrumb=excluded.breadcrumb,
-        child_count=excluded.child_count,
-        applicable_from=excluded.applicable_from,
-        applicable_through=excluded.applicable_through
-    `);
-    const save = this.db.transaction((items: PageLink[]) => {
-      for (const link of items) {
-        const scope = parseApplicability(link.breadcrumb.join(" "));
-        insert.run(
-          vehicleRoot,
-          link.title,
-          link.path,
-          JSON.stringify(link.breadcrumb),
-          link.childCount,
-          scope.from,
-          scope.through,
+      let links: PageLink[];
+      try {
+        links = (
+          await fetchTreeLinks(baseUrl, repairTreePath(vehicleRoot))
+        ).filter((link) => link.title && link.breadcrumb.length > 0);
+      } catch (cause) {
+        throw new PublicError(
+          "Title search is unavailable for this manual.",
+          `Could not index ${repairTreePath(vehicleRoot)}: ${errorDetail(cause)}`,
+          { cause },
         );
       }
-      this.db.prepare(`
-        INSERT INTO manual_index_state(vehicle_root, titles_indexed, bodies_indexed, updated_at)
-        VALUES (?, 1, 0, ?)
-        ON CONFLICT(vehicle_root) DO UPDATE SET titles_indexed=1, updated_at=excluded.updated_at
-      `).run(vehicleRoot, new Date().toISOString());
+      if (links.length === 0) {
+        throw new PublicError(
+          "Title search is unavailable for this manual.",
+          `Repair tree ${repairTreePath(vehicleRoot)} returned no indexable links`,
+        );
+      }
+
+      const insert = this.db.prepare(`
+        INSERT INTO manual_documents (
+          vehicle_root, title, path, breadcrumb, child_count,
+          applicable_from, applicable_through
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(vehicle_root, path) DO UPDATE SET
+          title=excluded.title, breadcrumb=excluded.breadcrumb,
+          child_count=excluded.child_count,
+          applicable_from=excluded.applicable_from,
+          applicable_through=excluded.applicable_through
+      `);
+      const save = this.db.transaction((items: PageLink[]) => {
+        for (const link of items) {
+          const scope = parseApplicability(link.breadcrumb.join(" "));
+          insert.run(
+            vehicleRoot,
+            link.title,
+            link.path,
+            JSON.stringify(link.breadcrumb),
+            link.childCount,
+            scope.from,
+            scope.through,
+          );
+        }
+        this.db.prepare(`
+          INSERT INTO manual_index_state(vehicle_root, titles_indexed, bodies_indexed, updated_at)
+          VALUES (?, 1, 0, ?)
+          ON CONFLICT(vehicle_root) DO UPDATE SET titles_indexed=1, updated_at=excluded.updated_at
+        `).run(vehicleRoot, new Date().toISOString());
+      });
+      save(links);
     });
-    save(links);
   }
 
   private async hydrateRows(baseUrl: string, rows: DocumentRow[]): Promise<void> {
     const update = this.db.prepare(`
-      UPDATE manual_documents SET body_text=?, image_only=?, body_indexed=1,
-        content_hash=?, fetch_error=? WHERE id=?
+      UPDATE manual_documents SET body_text=?, snippet_text=?, image_only=?,
+        image_count=?, body_indexed=1, content_hash=?, fetch_error=? WHERE id=?
     `);
     await mapConcurrent(rows, BODY_FETCH_CONCURRENCY, async (row) => {
       if (row.child_count > 0) {
-        update.run("", 0, null, null, row.id);
+        update.run("", "", 0, 0, null, null, row.id);
         return;
       }
       try {
         const page = await fetchDocumentPage(baseUrl, row.path, 1);
-        const body = markdownBody(page.markdown, row.title);
-        const imageOnly = body.length === 0 && page.imagePaths.length > 0;
+        const fields = extractIndexedFields(page.markdown, row.title, page.imagePaths);
+        // Yield after each conversion so a long ingest never monopolises the loop.
+        await yieldMacrotask();
         update.run(
-          body,
-          imageOnly ? 1 : 0,
-          contentHash(body || page.markdown, page.imagePaths),
+          fields.bodyText,
+          fields.snippetText,
+          fields.imageOnly ? 1 : 0,
+          fields.imageCount,
+          contentHash(fields.bodyText || page.markdown, page.imagePaths),
           null,
           row.id,
         );
@@ -323,6 +466,8 @@ export class ManualSearchIndex {
         );
         update.run(
           "",
+          "[No page body text is available.]",
+          0,
           0,
           createHash("sha256").update(`unavailable\0${row.path}`).digest("hex"),
           errorDetail(error),
@@ -334,15 +479,18 @@ export class ManualSearchIndex {
 
   private async ensureBodies(baseUrl: string, vehicleRoot: string): Promise<void> {
     if (this.state(vehicleRoot)?.bodies_indexed) return;
-    const rows = this.db
-      .query(
-        "SELECT * FROM manual_documents WHERE vehicle_root=? AND body_indexed=0",
-      )
-      .all(vehicleRoot) as DocumentRow[];
-    await this.hydrateRows(baseUrl, rows);
-    this.db.prepare(
-      "UPDATE manual_index_state SET bodies_indexed=1, updated_at=? WHERE vehicle_root=?",
-    ).run(new Date().toISOString(), vehicleRoot);
+    await this.runExclusive(`bodies:${vehicleRoot}`, async () => {
+      if (this.state(vehicleRoot)?.bodies_indexed) return;
+      const rows = this.db
+        .query(
+          "SELECT * FROM manual_documents WHERE vehicle_root=? AND body_indexed=0",
+        )
+        .all(vehicleRoot) as DocumentRow[];
+      await this.hydrateRows(baseUrl, rows);
+      this.db.prepare(
+        "UPDATE manual_index_state SET bodies_indexed=1, updated_at=? WHERE vehicle_root=?",
+      ).run(new Date().toISOString(), vehicleRoot);
+    });
   }
 
   /** Fully ingest one manual. Used by the offline index builder and body search. */
@@ -371,14 +519,22 @@ export class ManualSearchIndex {
     query: string,
     limit: number,
     mode: ManualSearchMode = "both",
+    applicableOnly = false,
   ): Promise<ManualSearchResult[]> {
     if (!ftsTerms(query)) return [];
     await this.ensureTitles(baseUrl, vehicleRoot);
     if (mode === "title") {
-      const candidates = this.matchingRows(vehicleRoot, query, mode).filter(
-        (row) => !row.body_indexed,
-      );
-      await this.hydrateRows(baseUrl, candidates);
+      // Serialize title-mode hydration per vehicle so two concurrent searches
+      // cannot both select body_indexed=0 and let a failure write clobber a
+      // successful body write.
+      await this.runExclusive(`title-hydrate:${vehicleRoot}`, async () => {
+        const candidates = this.matchingRows(vehicleRoot, query, mode).filter(
+          (row) => !row.body_indexed,
+        );
+        if (candidates.length > 0) {
+          await this.hydrateRows(baseUrl, candidates);
+        }
+      });
     } else {
       await this.ensureBodies(baseUrl, vehicleRoot);
     }
@@ -398,7 +554,13 @@ export class ManualSearchIndex {
     }
 
     const year = vehicleYear(vehicleRoot);
-    const results: ManualSearchResult[] = [];
+    type Ranked = {
+      result: ManualSearchResult;
+      rank: number;
+      id: number;
+      nonApplicable: boolean;
+    };
+    const ranked: Ranked[] = [];
     for (const row of unique.values()) {
       const breadcrumb = JSON.parse(row.breadcrumb) as string[];
       const aliases = row.content_hash
@@ -408,29 +570,47 @@ export class ManualSearchIndex {
             ORDER BY id
           `).all(vehicleRoot, row.content_hash, row.id) as { breadcrumb: string }[])
         : [];
+      const applies =
+        row.applicable_from || row.applicable_through
+          ? appliesToYear(year, row.applicable_from, row.applicable_through)
+          : null;
+      if (applicableOnly && applies === false) continue;
+
       const result: ManualSearchResult = {
         title: row.title,
         path: row.path,
         breadcrumb,
         also_under: aliases.map((alias) => JSON.parse(alias.breadcrumb) as string[]),
-        snippet: snippet(row.body_text, Boolean(row.image_only)),
+        snippet: row.snippet_text || "[No page body text is available.]",
         image_only: Boolean(row.image_only),
       };
       if (row.applicable_from || row.applicable_through) {
         result.applicability = {
           ...(row.applicable_from ? { from: row.applicable_from } : {}),
           ...(row.applicable_through ? { through: row.applicable_through } : {}),
-          appliesToVehicleYear: appliesToYear(
-            year,
-            row.applicable_from,
-            row.applicable_through,
-          ),
+          appliesToVehicleYear: applies,
         };
       }
-      results.push(result);
-      if (results.length >= limit) break;
+
+      const baseRank = row.rank ?? 0;
+      const boost = mode === "body" ? bodyModeScoreBoost(row.title, query) : 0;
+      ranked.push({
+        result,
+        rank: baseRank - boost,
+        id: row.id,
+        nonApplicable: applies === false,
+      });
     }
-    return results;
+
+    // Non-applicable last; within a bucket keep bm25/id order (stable for ties).
+    ranked.sort((a, b) => {
+      if (a.nonApplicable !== b.nonApplicable) {
+        return a.nonApplicable ? 1 : -1;
+      }
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      return a.id - b.id;
+    });
+    return ranked.slice(0, limit).map((entry) => entry.result);
   }
 }
 
@@ -442,8 +622,16 @@ export async function searchManual(
   query: string,
   limit: number,
   mode: ManualSearchMode = "both",
+  applicableOnly = false,
 ): Promise<ManualSearchResult[]> {
-  return defaultIndex.search(baseUrl, vehicleRootPath, query, limit, mode);
+  return defaultIndex.search(
+    baseUrl,
+    vehicleRootPath,
+    query,
+    limit,
+    mode,
+    applicableOnly,
+  );
 }
 
 export function clearManualSearchCache(): void {

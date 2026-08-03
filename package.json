@@ -10,6 +10,7 @@
     "live-corpus": "bun test/corpus-regression.ts"
   },
   "dependencies": {
+    "@mixmark-io/domino": "^2.2.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/turndown": "^5.0.6",
     "turndown": "^7.2.4",

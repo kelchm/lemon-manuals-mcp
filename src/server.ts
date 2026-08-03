@@ -114,8 +114,12 @@ export function buildServer(
     {
       description:
         "Search one vehicle manual's titles, body text, or both using a persistent full-text index. " +
-        "mode defaults to both; every normalized query token must match. The first search of an unindexed manual may take time while its split tree and page bodies are ingested. " +
-        "Results are unique documents: duplicate placements appear in also_under, snippet is body text, and applicability labels are parsed when present. " +
+        "mode defaults to both; every normalized query token must match, so a page missing any token is excluded; " +
+        "drop tokens to broaden a search that returns []. " +
+        "The first search of an unindexed manual may take time while its split tree and page bodies are ingested. " +
+        "Results are unique documents: duplicate placements appear in also_under; snippet is body prose or " +
+        "'[image only — N images]' when the page has images but no remaining prose; applicability labels are parsed when present. " +
+        "Set applicable_only to true to drop results whose applicability.appliesToVehicleYear is false. " +
         "Use a vehicle root uriPath from search_vehicles. Paths are opaque encoded tokens: " +
         "pass them exactly as returned and never decode them.",
       inputSchema: {
@@ -130,11 +134,24 @@ export function buildServer(
           .default("both")
           .describe("fields to search"),
         limit: z.number().int().min(1).max(100).default(20),
+        applicable_only: z
+          .boolean()
+          .default(false)
+          .describe(
+            "when true, omit results with applicability.appliesToVehicleYear === false",
+          ),
       },
     },
-    async ({ path, query, mode, limit }) => {
+    async ({ path, query, mode, limit, applicable_only }) => {
       try {
-        const results = await manualIndex.search(baseUrl, path, query, limit, mode);
+        const results = await manualIndex.search(
+          baseUrl,
+          path,
+          query,
+          limit,
+          mode,
+          applicable_only,
+        );
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(results, null, 1) },

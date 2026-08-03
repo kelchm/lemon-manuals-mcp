@@ -1,3 +1,4 @@
+import { createDocument } from "@mixmark-io/domino";
 import TurndownService from "turndown";
 import { PublicError, errorDetail } from "./errors.js";
 
@@ -5,6 +6,9 @@ export const DEFAULT_MAX_BYTES = 40_000;
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 export const TRUNCATION_MARKER =
   "[truncated — refetch with higher max_bytes or narrower depth]";
+
+/** Yield every N anchors so long repair-tree walks do not starve /healthz. */
+const LINK_WALK_YIELD_EVERY = 500;
 
 export interface PageLink {
   title: string;
@@ -23,6 +27,11 @@ export interface PageResult {
 export interface ImageResult {
   data: string;
   mimeType: string;
+}
+
+export interface ImageDimensions {
+  width: number;
+  height: number;
 }
 
 interface HtmlPage {
@@ -298,6 +307,44 @@ export function convertHtmlToMarkdown(
   return { markdown, contentType: "text/html", links, imagePaths };
 }
 
+/**
+ * Collect directory-tree links by walking the DOM only — no Turndown, no
+ * markdown string. Must match convertHtmlToMarkdown(...).links for the same input
+ * except title whitespace: Turndown collapses whitespace across block children
+ * before its rules run (e.g. "BrakeSystemRepair"), while this reads the live DOM
+ * and keeps word boundaries ("Brake System Repair"). The index is rebuilt from
+ * scratch, so the more correct uncollapsed titles are intentional.
+ */
+export async function extractTreeLinks(
+  html: string,
+  pageUrl: string,
+): Promise<PageLink[]> {
+  // Same wrapper Turndown uses so head/body reparenting cannot scramble anchors.
+  const doc = createDocument(
+    `<x-turndown id="turndown-root">${html}</x-turndown>`,
+  );
+  const root = doc.getElementById("turndown-root") ?? doc.body ?? doc;
+  const anchors = Array.from(root.getElementsByTagName("a")) as HTMLElement[];
+  const links: PageLink[] = [];
+  for (let i = 0; i < anchors.length; i++) {
+    if (i > 0 && i % LINK_WALK_YIELD_EVERY === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    const node = anchors[i]!;
+    // HTML anchors are "A"; SVG <a> stays lowercase — Turndown only collected HTML.
+    if (node.nodeName !== "A") continue;
+    const linkPath = node.getAttribute("href") ?? node.getAttribute("name");
+    if (!linkPath) continue;
+    links.push({
+      title: cleanText(node.textContent ?? ""),
+      path: normalizeSitePath(linkPath, pageUrl),
+      breadcrumb: breadcrumbFor(node),
+      childCount: childCountFor(node),
+    });
+  }
+  return links;
+}
+
 async function fetchHtmlPage(baseUrl: string, path: string): Promise<HtmlPage> {
   const url = backendUrl(baseUrl, path);
   let res: Response;
@@ -339,6 +386,15 @@ export async function fetchPage(
   const page = await fetchHtmlPage(baseUrl, path);
   const converted = convertHtmlToMarkdown(page.html, page.url, depth);
   return { ...converted, contentType: page.contentType };
+}
+
+/** Fetch a repair-tree page and return only its links (no markdown conversion). */
+export async function fetchTreeLinks(
+  baseUrl: string,
+  path: string,
+): Promise<PageLink[]> {
+  const page = await fetchHtmlPage(baseUrl, path);
+  return extractTreeLinks(page.html, page.url);
 }
 
 export function truncateMarkdown(markdown: string, maxBytes: number): string {
@@ -439,7 +495,9 @@ export async function fetchImage(
     );
   }
 
-  const statedSize = Number(res.headers.get("content-length"));
+  const contentLengthHeader = res.headers.get("content-length");
+  const statedSize =
+    contentLengthHeader !== null ? Number(contentLengthHeader) : Number.NaN;
   if (Number.isFinite(statedSize) && statedSize > MAX_IMAGE_BYTES) {
     throw new PublicError(
       `Image is ${statedSize} bytes, above the ${MAX_IMAGE_BYTES}-byte (2 MB) limit. ` +
@@ -449,6 +507,12 @@ export async function fetchImage(
   }
 
   const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength === 0) {
+    throw new PublicError(
+      "The upstream response claimed to be an image, but its payload is invalid.",
+      `GET ${url} returned 0 bytes as ${mimeType}`,
+    );
+  }
   if (bytes.byteLength > MAX_IMAGE_BYTES) {
     throw new PublicError(
       `Image is ${bytes.byteLength} bytes, above the ${MAX_IMAGE_BYTES}-byte (2 MB) limit. ` +
@@ -462,14 +526,102 @@ export async function fetchImage(
       `GET ${url} returned ${bytes.byteLength} bytes as ${mimeType} with no matching image signature`,
     );
   }
+
+  const dimensions = parseImageDimensions(bytes, mimeType);
+  if (dimensions !== undefined) {
+    if (
+      dimensions === null ||
+      dimensions.width === 0 ||
+      dimensions.height === 0
+    ) {
+      throw new PublicError(
+        "The upstream response claimed to be an image, but its payload is invalid.",
+        `GET ${url} returned ${bytes.byteLength} bytes as ${mimeType} with unparseable or zero dimensions`,
+      );
+    }
+  }
+
+  const declared =
+    Number.isFinite(statedSize) ? String(statedSize) : "unknown";
+  const dimLabel =
+    dimensions && dimensions.width > 0
+      ? `${dimensions.width}x${dimensions.height}`
+      : "n/a";
   console.error(
-    `[lemon-mcp] get_image served ${bytes.byteLength} bytes (${mimeType})`,
+    `[lemon-mcp] get_image served ${bytes.byteLength} bytes (${mimeType}) ` +
+      `content-length=${declared} dimensions=${dimLabel}`,
   );
   return { data: Buffer.from(bytes).toString("base64"), mimeType };
 }
 
 function startsWith(bytes: Uint8Array, signature: number[]): boolean {
   return signature.every((value, index) => bytes[index] === value);
+}
+
+const JPEG_SOF_MARKERS = new Set([
+  0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+]);
+
+/**
+ * Intrinsic dimensions for PNG/JPEG. Returns null when the type is parseable
+ * but dimensions cannot be read; undefined for mime types we do not parse.
+ */
+export function parseImageDimensions(
+  bytes: Uint8Array,
+  mimeType: string,
+): ImageDimensions | null | undefined {
+  if (mimeType === "image/png") {
+    if (bytes.byteLength < 24) return null;
+    // First chunk must be IHDR; a valid signature alone is not enough.
+    if (
+      bytes[12] !== 0x49 ||
+      bytes[13] !== 0x48 ||
+      bytes[14] !== 0x44 ||
+      bytes[15] !== 0x52
+    ) {
+      return null;
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (mimeType === "image/jpeg" || mimeType === "image/jpg") {
+    return parseJpegDimensions(bytes);
+  }
+  return undefined;
+}
+
+function parseJpegDimensions(bytes: Uint8Array): ImageDimensions | null {
+  if (bytes.byteLength < 4) return null;
+  let offset = 2;
+  while (offset + 8 < bytes.byteLength) {
+    if (bytes[offset] !== 0xff) return null;
+    // JPEG allows one or more 0xFF fill bytes before a marker.
+    let markerOffset = offset + 1;
+    while (markerOffset < bytes.byteLength && bytes[markerOffset] === 0xff) {
+      markerOffset += 1;
+    }
+    if (markerOffset >= bytes.byteLength) return null;
+    const marker = bytes[markerOffset]!;
+    // Standalone markers without a length field.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
+      offset = markerOffset + 1;
+      continue;
+    }
+    if (JPEG_SOF_MARKERS.has(marker)) {
+      if (markerOffset + 7 >= bytes.byteLength) return null;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      return {
+        height: view.getUint16(markerOffset + 4),
+        width: view.getUint16(markerOffset + 6),
+      };
+    }
+    if (markerOffset + 2 >= bytes.byteLength) return null;
+    const segmentLength =
+      (bytes[markerOffset + 1]! << 8) | bytes[markerOffset + 2]!;
+    if (segmentLength < 2) return null;
+    offset = markerOffset + 1 + segmentLength;
+  }
+  return null;
 }
 
 /** Reject HTML error bodies and truncated payloads mislabeled as images. */
