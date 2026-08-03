@@ -7,12 +7,21 @@ LEMON/CHARM car-repair-manual archive (`lemon.home.kelch.io`, home-lab repo
 Tools:
 
 - `list_makes` — all makes with vehicle counts and year ranges
-- `search_vehicles` — free-text over make/model/engine/year → manual root paths
-- `get_page` — any site path → markdown (nav chrome stripped, links preserved)
+- `search_vehicles` — free-text over make/model/engine/year → deduplicated manual roots and variants
+- `get_page` — opaque encoded site path → normalized markdown, with tree depth and byte controls
+- `search_manual` — all-token, title-only search within one vehicle manual (cached for eight vehicles)
+- `get_image` — opaque encoded image path → MCP image block (2 MB maximum)
+
+All returned paths are opaque encoded tokens. Pass them to `get_page`,
+`search_manual`, or `get_image` exactly as returned; never decode or rebuild them.
+`search_manual` matches titles only (not breadcrumbs or page body text) and
+returns each match's breadcrumb as context.
 
 Browse/search is answered locally from the databases' `index.json` files
 (~305k vehicles, ~200ms load); page content is fetched from the lemon-website
-server and converted with turndown.
+server and converted with turndown. Relative and `/hyperlink/...` references are
+normalized to absolute encoded site paths that can be passed directly back to
+the tools.
 
 ## Setup
 

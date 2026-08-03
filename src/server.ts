@@ -3,14 +3,16 @@ import { z } from "zod";
 import type { VehicleIndex } from "./vehicles.js";
 import {
   DEFAULT_MAX_BYTES,
+  fetchImage,
   fetchResolvedPage,
   TRUNCATION_MARKER,
 } from "./page.js";
+import { searchManual } from "./manual.js";
 
 const MIN_MAX_BYTES = new TextEncoder().encode(`\n\n${TRUNCATION_MARKER}`).length;
 
 export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
-  const server = new McpServer({ name: "lemon-manuals", version: "0.1.0" });
+  const server = new McpServer({ name: "lemon-manuals", version: "0.2.0" });
 
   server.registerTool(
     "list_makes",
@@ -85,6 +87,56 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
     async ({ path, depth, max_bytes }) => {
       const page = await fetchResolvedPage(baseUrl, path, depth, max_bytes);
       return { content: [{ type: "text", text: page.markdown }] };
+    },
+  );
+
+  server.registerTool(
+    "search_manual",
+    {
+      description:
+        "Search one vehicle manual's page TITLES only, not page body text. " +
+        "Every query token must occur in a title; component codes such as J518 work because they appear in titles. " +
+        "Use a vehicle root uriPath from search_vehicles. Paths are opaque encoded tokens: " +
+        "pass them exactly as returned and never decode them.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe(
+            "opaque encoded vehicle root uriPath from search_vehicles; pass exactly as returned, never decode",
+          ),
+        query: z.string().min(1).describe("tokens to match in page titles"),
+        limit: z.number().int().min(1).max(100).default(20),
+      },
+    },
+    async ({ path, query, limit }) => {
+      const results = await searchManual(baseUrl, path, query, limit);
+      return {
+        content: [{ type: "text", text: JSON.stringify(results, null, 1) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    "get_image",
+    {
+      description:
+        "Fetch an image from a manual Markdown image path and return an MCP image block (maximum 2 MB). " +
+        "Paths are opaque encoded tokens: pass them exactly as returned and never decode them.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe(
+            "opaque encoded image path; pass exactly as returned, never decode",
+          ),
+      },
+    },
+    async ({ path }) => {
+      const image = await fetchImage(baseUrl, path);
+      return {
+        content: [
+          { type: "image", data: image.data, mimeType: image.mimeType },
+        ],
+      };
     },
   );
 
