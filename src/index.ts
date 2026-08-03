@@ -10,11 +10,19 @@ import { buildServer } from "./server.js";
 const BASE_URL = process.env["LEMON_BASE_URL"] ?? "http://127.0.0.1:18080";
 const DATA_DIR =
   process.env["LEMON_DATA_DIR"] ?? join(import.meta.dir, "..", "data");
+// Local dev uses data/<db>-index.json copies; in-cluster, point these at the
+// share layout (/data/lemon/index.json, /data/charm/index.json).
+const INDEX_FILES = {
+  lemon: process.env["LEMON_INDEX_JSON"] ?? join(DATA_DIR, "lemon-index.json"),
+  charm: process.env["CHARM_INDEX_JSON"] ?? join(DATA_DIR, "charm-index.json"),
+};
 const PORT = Number(process.env["PORT"] ?? 8787);
 
-console.error(`[lemon-mcp] loading vehicle indexes from ${DATA_DIR}...`);
+console.error(
+  `[lemon-mcp] loading vehicle indexes: ${INDEX_FILES.lemon}, ${INDEX_FILES.charm}`,
+);
 const started = Date.now();
-const index = new VehicleIndex(DATA_DIR);
+const index = new VehicleIndex(INDEX_FILES);
 console.error(
   `[lemon-mcp] ${index.size} vehicles loaded in ${Date.now() - started}ms; pages via ${BASE_URL}`,
 );

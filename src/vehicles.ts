@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 
 export interface Vehicle {
   make: string;
@@ -43,10 +42,11 @@ export class VehicleIndex {
   private entries: SearchEntry[] = [];
   readonly makes: MakeSummary[];
 
-  constructor(dataDir: string) {
+  constructor(indexFiles: { lemon: string; charm: string }) {
     for (const database of ["lemon", "charm"] as const) {
-      const file = join(dataDir, `${database}-index.json`);
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as IndexFile;
+      const parsed = JSON.parse(
+        readFileSync(indexFiles[database], "utf8"),
+      ) as IndexFile;
       for (const v of parsed.vehicles) {
         const vehicle: Vehicle = { ...v, database };
         this.entries.push({
