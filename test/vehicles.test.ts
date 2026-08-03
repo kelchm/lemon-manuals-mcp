@@ -76,5 +76,12 @@ describe("VehicleIndex.search", () => {
     expect(results[0]?.databases).toEqual(["lemon", "charm"]);
     expect(results[0]?.variants).toEqual(["3.2 C", "3.2 G", "V6-3.2L (BMX)"]);
     expect(results[0]?.manuals).toHaveLength(3);
+    for (const manual of results[0]?.manuals ?? []) {
+      expect(Object.keys(manual).sort()).toEqual(["database", "engine", "uriPath"]);
+      expect(manual.database === "lemon" || manual.database === "charm").toBeTrue();
+      expect(typeof manual.uriPath).toBe("string");
+    }
+    // Internal index still sees full Vehicle entries for complete-root discovery.
+    expect(index.completeVehicleRoots().length).toBeGreaterThan(0);
   });
 });

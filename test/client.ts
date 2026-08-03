@@ -5,6 +5,13 @@ import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+// J518 door-handle track diagram, pinned end-to-end through the MCP transport so
+// base64 round-tripping cannot silently truncate an image block.
+const CANARY_IMAGE_PATH = "/images/IMP66Q313/euro600/891404313/";
+const CANARY_IMAGE_BYTE_LENGTH = 22_388;
+const CANARY_IMAGE_WIDTH = 1584;
+const CANARY_IMAGE_HEIGHT = 2000;
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -15,6 +22,7 @@ interface ContentBlock {
 interface SearchVehicle {
   uriPath: string;
   variants: string[];
+  manuals?: { database: string; engine: string | null; uriPath: string }[];
   rootUriTable?: unknown;
   rootLinkTable?: unknown;
 }
@@ -24,6 +32,11 @@ interface ManualHit {
   path: string;
   snippet: string;
   also_under: string[][];
+  applicability?: {
+    from?: string;
+    through?: string;
+    appliesToVehicleYear: boolean | null;
+  };
 }
 
 function contentBlocks(result: unknown): ContentBlock[] {
@@ -96,6 +109,15 @@ try {
     assert(Array.isArray(vehicle.variants));
     assert(!("rootUriTable" in vehicle), "rootUriTable leaked into output");
     assert(!("rootLinkTable" in vehicle), "rootLinkTable leaked into output");
+    if (vehicle.manuals) {
+      for (const manual of vehicle.manuals) {
+        assert.deepEqual(
+          Object.keys(manual).sort(),
+          ["database", "engine", "uriPath"],
+          "search_vehicles manuals[] must be trimmed ManualRef entries",
+        );
+      }
+    }
   }
   console.log("deduped search '2005 touareg':", searchText.slice(0, 400));
 
@@ -112,7 +134,7 @@ try {
 
   const j518Root =
     process.env["SMOKE_J518_ROOT"] ??
-    "/Volkswagen/2005/Touareg%20V6%2C%203.2%20C/";
+    "/Volkswagen/2005/Touareg%20%287LA%29%20V8-4.2L%20%28BHX%29/";
   const manualSearchText = firstText(
     await client.callTool({
       name: "search_manual",
@@ -174,6 +196,75 @@ try {
     imageBlock.mimeType,
     `${Buffer.from(imageBlock.data, "base64").byteLength} bytes`,
   );
+
+  // Canary image: pin byte length and pixel dimensions once filled from a live run.
+  if (CANARY_IMAGE_BYTE_LENGTH > 0) {
+    const canaryResult = await client.callTool({
+      name: "get_image",
+      arguments: { path: CANARY_IMAGE_PATH },
+    });
+    const canary = contentBlocks(canaryResult).find((block) => block.type === "image");
+    assert(canary?.data, "canary get_image returned no image block");
+    const canaryBytes = Buffer.from(canary.data, "base64");
+    assert.equal(
+      canaryBytes.byteLength,
+      CANARY_IMAGE_BYTE_LENGTH,
+      "canary image byte length drifted",
+    );
+    // PNG width/height live at offsets 16 and 20.
+    if (canary.mimeType === "image/png") {
+      assert.equal(canaryBytes.readUInt32BE(16), CANARY_IMAGE_WIDTH);
+      assert.equal(canaryBytes.readUInt32BE(20), CANARY_IMAGE_HEIGHT);
+    }
+    console.log(
+      "canary get_image:",
+      canary.mimeType,
+      `${canaryBytes.byteLength} bytes`,
+      `${CANARY_IMAGE_WIDTH}x${CANARY_IMAGE_HEIGHT}`,
+    );
+  } else {
+    console.log("canary get_image: skipped (TODO constants not pinned yet)");
+  }
+
+  const missingImage = await client.callTool({
+    name: "get_image",
+    arguments: { path: "/images/does-not-exist/missing.png" },
+  }) as { content: ContentBlock[]; isError?: boolean };
+  assert(missingImage.isError, "missing get_image should be an error result");
+  const missingText = contentBlocks(missingImage).find((block) => block.type === "text")?.text ?? "";
+  assert(missingText.length > 0, "missing get_image must return a text error, not an empty block");
+  assert(!contentBlocks(missingImage).some((block) => block.type === "image"));
+  console.log("missing get_image error:", missingText.slice(0, 200));
+
+  const rankedRoot =
+    process.env["SMOKE_J518_ROOT"] ??
+    "/Volkswagen/2005/Touareg%20%287LA%29%20V8-4.2L%20%28BHX%29/";
+  const rankedText = firstText(
+    await client.callTool({
+      name: "search_manual",
+      arguments: { path: rankedRoot, query: "J518", mode: "title", limit: 50 },
+    }),
+  );
+  const rankedHits = JSON.parse(rankedText) as ManualHit[];
+  if (rankedHits.some((hit) => hit.applicability)) {
+    const firstFalse = rankedHits.findIndex(
+      (hit) => hit.applicability?.appliesToVehicleYear === false,
+    );
+    let lastTrueOrNull = -1;
+    for (let i = rankedHits.length - 1; i >= 0; i--) {
+      if (rankedHits[i]?.applicability?.appliesToVehicleYear !== false) {
+        lastTrueOrNull = i;
+        break;
+      }
+    }
+    if (firstFalse !== -1 && lastTrueOrNull !== -1) {
+      assert(
+        firstFalse > lastTrueOrNull,
+        "appliesToVehicleYear:true results must rank above false",
+      );
+    }
+    console.log("J518 applicability ordering ok on", rankedRoot);
+  }
 } finally {
   await client?.close().catch(() => undefined);
   child.kill();

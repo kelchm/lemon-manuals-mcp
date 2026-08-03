@@ -10,7 +10,20 @@ export interface Vehicle {
   database: "lemon" | "charm";
 }
 
+/** Slim manual handle returned by search_vehicles (not the internal index entry). */
+export interface ManualRef {
+  database: "lemon" | "charm";
+  engine: string | null;
+  uriPath: string;
+}
+
 export interface VehicleSearchResult extends Vehicle {
+  variants: string[];
+  databases: ("lemon" | "charm")[];
+  manuals: ManualRef[];
+}
+
+interface IndexedVehicle extends Vehicle {
   variants: string[];
   databases: ("lemon" | "charm")[];
   manuals: Vehicle[];
@@ -42,7 +55,7 @@ export const normalize = (s: string): string =>
   s.toLowerCase().normalize("NFKD").replace(/[^a-z0-9 ]+/g, " ");
 
 interface SearchEntry {
-  vehicle: VehicleSearchResult;
+  vehicle: IndexedVehicle;
   haystack: string;
 }
 
@@ -207,7 +220,15 @@ export class VehicleIndex {
     const results: VehicleSearchResult[] = [];
     for (const { vehicle, haystack } of this.entries) {
       if (tokens.every((t) => haystack.includes(t))) {
-        results.push(vehicle);
+        // Trim manuals for the wire payload only; completeVehicleRoots needs full entries.
+        results.push({
+          ...vehicle,
+          manuals: vehicle.manuals.map(({ database, engine, uriPath }) => ({
+            database,
+            engine,
+            uriPath,
+          })),
+        });
         if (results.length >= limit) break;
       }
     }
