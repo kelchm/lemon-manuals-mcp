@@ -2,6 +2,13 @@
   "name": "lemon-manuals-mcp",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "index-manuals": "bun src/build-search-index.ts",
+    "live-smoke": "bun test/client.ts",
+    "live-corpus": "bun test/corpus-regression.ts"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/turndown": "^5.0.6",

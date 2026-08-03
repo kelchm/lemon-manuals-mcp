@@ -12,6 +12,8 @@ export interface Vehicle {
 
 export interface VehicleSearchResult extends Vehicle {
   variants: string[];
+  databases: ("lemon" | "charm")[];
+  manuals: Vehicle[];
 }
 
 interface IndexFile {
@@ -86,6 +88,8 @@ export class VehicleIndex {
             vehicle: {
               ...vehicle,
               variants: variant ? [variant] : [],
+              databases: [database],
+              manuals: [],
             },
             haystack: vehicleHaystack,
           });
@@ -113,7 +117,70 @@ export class VehicleIndex {
       }
     }
 
-    this.entries = [...byManual.values()];
+    const byDrivetrain = new Map<string, SearchEntry>();
+    for (const entry of byManual.values()) {
+      const { vehicle } = entry;
+      const modelFamily = normalize(vehicle.model.replace(/\([^)]*\)/g, " "))
+        .trim()
+        .replace(/\s+/g, " ");
+      const displacement = vehicle.engine?.match(/\b(\d+\.\d+)\s*l?\b/i)?.[1];
+      // Displacement is the only shared engine vocabulary between the terse
+      // LEMON labels ("4.2 M") and CHARM labels ("V8-4.2L (BHX)"). Keep
+      // unparseable engines separate rather than guessing.
+      const drivetrainKey = displacement
+        ? [
+            normalize(vehicle.make),
+            [...vehicle.years].sort().join(","),
+            modelFamily,
+            displacement,
+          ].join("|")
+        : `manual:${vehicle.database}:${vehicle.uriPath}`;
+      const existing = byDrivetrain.get(drivetrainKey);
+      const manual: Vehicle = {
+        make: vehicle.make,
+        years: vehicle.years,
+        model: vehicle.model,
+        engine: vehicle.engine,
+        uriPath: vehicle.uriPath,
+        isComplete: vehicle.isComplete,
+        database: vehicle.database,
+      };
+      if (!existing) {
+        byDrivetrain.set(drivetrainKey, {
+          vehicle: {
+            ...vehicle,
+            databases: [vehicle.database],
+            manuals: [manual],
+          },
+          haystack: entry.haystack,
+        });
+        continue;
+      }
+      existing.haystack += ` ${entry.haystack}`;
+      existing.vehicle.manuals.push(manual);
+      if (!existing.vehicle.databases.includes(vehicle.database)) {
+        existing.vehicle.databases.push(vehicle.database);
+      }
+      for (const variant of vehicle.variants) {
+        if (!existing.vehicle.variants.includes(variant)) {
+          existing.vehicle.variants.push(variant);
+        }
+      }
+      // Prefer CHARM's descriptive engine code and cleaner tree as the primary
+      // backward-compatible uriPath, while retaining every manual above.
+      if (
+        vehicle.database === "charm" &&
+        existing.vehicle.database !== "charm"
+      ) {
+        Object.assign(existing.vehicle, manual, {
+          variants: existing.vehicle.variants,
+          databases: existing.vehicle.databases,
+          manuals: existing.vehicle.manuals,
+        });
+      }
+    }
+
+    this.entries = [...byDrivetrain.values()];
     this.makes = [...byMake.values()].sort((a, b) =>
       a.make.localeCompare(b.make),
     );
@@ -121,6 +188,16 @@ export class VehicleIndex {
 
   get size(): number {
     return this.vehicleCount;
+  }
+
+  completeVehicleRoots(): string[] {
+    const roots = new Set<string>();
+    for (const { vehicle } of this.entries) {
+      for (const manual of vehicle.manuals) {
+        if (manual.isComplete) roots.add(manual.uriPath);
+      }
+    }
+    return [...roots];
   }
 
   /** Every whitespace-separated query token must appear in the manual haystack. */

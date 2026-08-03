@@ -47,4 +47,34 @@ describe("VehicleIndex.search", () => {
     expect(results[0]).not.toHaveProperty("rootUriTable");
     expect(results[0]).not.toHaveProperty("rootLinkTable");
   });
+
+  test("groups equivalent LEMON and CHARM drivetrains and exposes every source", () => {
+    const lemonPath = join(fixtureDir, "lemon-touareg.json");
+    const charmPath = join(fixtureDir, "charm-touareg.json");
+    const base = {
+      make: "Volkswagen",
+      years: ["2005"],
+      model: "Touareg",
+      isComplete: true,
+    };
+    writeFileSync(lemonPath, JSON.stringify({ database: "lemon", vehicles: [
+      { ...base, engine: "3.2 C", uriPath: "/Volkswagen/2005/Touareg%203.2%20C/" },
+      { ...base, engine: "3.2 G", uriPath: "/Volkswagen/2005/Touareg%203.2%20G/" },
+      { ...base, engine: "4.2 M", uriPath: "/Volkswagen/2005/Touareg%204.2%20M/" },
+    ] }));
+    writeFileSync(charmPath, JSON.stringify({ database: "charm", vehicles: [
+      { ...base, model: "Touareg (7LA)", engine: "V6-3.2L (BMX)", uriPath: "/Volkswagen/2005/Touareg%20V6-3.2L/" },
+      { ...base, model: "Touareg (7LA)", engine: "V8-4.2L (BHX)", uriPath: "/Volkswagen/2005/Touareg%20V8-4.2L/" },
+      { ...base, model: "Touareg (7LA)", engine: "V10-5.0L DSL Turbo (BKW)", uriPath: "/Volkswagen/2005/Touareg%20V10-5.0L/" },
+    ] }));
+
+    const index = new VehicleIndex({ lemon: lemonPath, charm: charmPath });
+    const results = index.search("2005 touareg", 20);
+
+    expect(results).toHaveLength(3);
+    expect(results[0]?.database).toBe("charm");
+    expect(results[0]?.databases).toEqual(["lemon", "charm"]);
+    expect(results[0]?.variants).toEqual(["3.2 C", "3.2 G", "V6-3.2L (BMX)"]);
+    expect(results[0]?.manuals).toHaveLength(3);
+  });
 });

@@ -1,4 +1,5 @@
 import TurndownService from "turndown";
+import { PublicError, errorDetail } from "./errors.js";
 
 export const DEFAULT_MAX_BYTES = 40_000;
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -9,6 +10,7 @@ export interface PageLink {
   title: string;
   path: string;
   breadcrumb: string[];
+  childCount: number;
 }
 
 export interface PageResult {
@@ -122,6 +124,18 @@ function breadcrumbFor(anchor: HTMLElement): string[] {
   return reversed;
 }
 
+function childCountFor(anchor: HTMLElement): number {
+  let item = anchor.parentElement as HTMLElement | null;
+  while (item && item.nodeName !== "LI") {
+    item = item.parentElement as HTMLElement | null;
+  }
+  if (!item) return 0;
+  return directChildLists(item).reduce(
+    (count, list) => count + directListItems(list).length,
+    0,
+  );
+}
+
 function applicability(title: string): string | undefined {
   const matches = title.match(APPLICABILITY_PATTERN);
   return matches?.join("; ");
@@ -198,7 +212,12 @@ export function convertHtmlToMarkdown(
       if (!linkPath) return content;
       const path = normalizeSitePath(linkPath, pageUrl);
       const title = cleanText(node.textContent ?? "");
-      links.push({ title, path, breadcrumb: breadcrumbFor(node) });
+      links.push({
+        title,
+        path,
+        breadcrumb: breadcrumbFor(node),
+        childCount: childCountFor(node),
+      });
 
       const scope = applicability(title);
       const annotated = scope
@@ -281,14 +300,27 @@ export function convertHtmlToMarkdown(
 
 async function fetchHtmlPage(baseUrl: string, path: string): Promise<HtmlPage> {
   const url = backendUrl(baseUrl, path);
-  const res = await fetch(url);
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (cause) {
+    throw new PublicError(
+      "The manual page could not be reached. Try again later.",
+      `GET ${url} failed: ${errorDetail(cause)}`,
+      { cause },
+    );
+  }
   if (!res.ok) {
-    throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+    throw new PublicError(
+      `The manual page is unavailable (upstream returned ${res.status}). Verify the opaque path came from this server.`,
+      `GET ${url} -> ${res.status} ${res.statusText}`,
+    );
   }
   const contentType = res.headers.get("content-type") ?? "unknown";
   if (!contentType.includes("text/html")) {
-    throw new Error(
-      `GET ${url} returned ${contentType}; use get_image for image paths.`,
+    throw new PublicError(
+      "This path is not a manual page. Use get_image for image paths.",
+      `GET ${url} returned ${contentType}; expected text/html`,
     );
   }
   const html = await res.text();
@@ -349,7 +381,11 @@ export async function fetchResolvedPage(
         const target = await fetchPage(baseUrl, targetPath, depth);
         targetMarkdown = target.markdown;
       } catch (error) {
-        targetMarkdown = `[resolution failed: ${error instanceof Error ? error.message : String(error)}]`;
+        console.error(
+          `[lemon-mcp] get_page stub resolution failed: ${errorDetail(error)}`,
+        );
+        targetMarkdown =
+          "[resolution failed: the linked manual page is unavailable]";
       }
       markdown =
         `## Stub page\n\n${stub.markdown}\n\n` +
@@ -360,39 +396,113 @@ export async function fetchResolvedPage(
   return { ...stub, markdown: truncateMarkdown(markdown, maxBytes) };
 }
 
+/** Resolve a short one-link publisher stub and return only the target content. */
+export async function fetchDocumentPage(
+  baseUrl: string,
+  path: string,
+  depth = 1,
+): Promise<PageResult> {
+  const page = await fetchPage(baseUrl, path, depth);
+  if (page.markdown.length >= 300 || page.links.length !== 1) return page;
+  const targetPath = page.links[0]?.path;
+  return targetPath ? fetchPage(baseUrl, targetPath, depth) : page;
+}
+
 export async function fetchImage(
   baseUrl: string,
   path: string,
 ): Promise<ImageResult> {
   const url = backendUrl(baseUrl, path);
-  const res = await fetch(url);
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (cause) {
+    throw new PublicError(
+      "The image could not be reached. Try again later.",
+      `GET ${url} failed: ${errorDetail(cause)}`,
+      { cause },
+    );
+  }
   if (!res.ok) {
-    throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+    throw new PublicError(
+      `The image is unavailable (upstream returned ${res.status}). Verify the opaque path came from get_page.`,
+      `GET ${url} -> ${res.status} ${res.statusText}`,
+    );
   }
 
   const rawContentType = res.headers.get("content-type") ?? "unknown";
   const mimeType = rawContentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
   if (!mimeType.startsWith("image/")) {
-    throw new Error(
-      `GET ${url} returned ${rawContentType}, not an image. ` +
-        "Use get_page for HTML/manual paths and get_image only for image-link paths.",
+    throw new PublicError(
+      "This path is not an image. Use get_image only with an image path returned by get_page.",
+      `GET ${url} returned ${rawContentType}; expected image/*`,
     );
   }
 
   const statedSize = Number(res.headers.get("content-length"));
   if (Number.isFinite(statedSize) && statedSize > MAX_IMAGE_BYTES) {
-    throw new Error(
+    throw new PublicError(
       `Image is ${statedSize} bytes, above the ${MAX_IMAGE_BYTES}-byte (2 MB) limit. ` +
-        `View it on the website instead: ${url}`,
+        "No partial image was returned.",
+      `GET ${url} declared ${statedSize} bytes, above ${MAX_IMAGE_BYTES}`,
     );
   }
 
   const bytes = new Uint8Array(await res.arrayBuffer());
   if (bytes.byteLength > MAX_IMAGE_BYTES) {
-    throw new Error(
+    throw new PublicError(
       `Image is ${bytes.byteLength} bytes, above the ${MAX_IMAGE_BYTES}-byte (2 MB) limit. ` +
-        `View it on the website instead: ${url}`,
+        "No partial image was returned.",
+      `GET ${url} contained ${bytes.byteLength} bytes, above ${MAX_IMAGE_BYTES}`,
     );
   }
+  if (!hasImageSignature(bytes, mimeType)) {
+    throw new PublicError(
+      "The upstream response claimed to be an image, but its payload is invalid.",
+      `GET ${url} returned ${bytes.byteLength} bytes as ${mimeType} with no matching image signature`,
+    );
+  }
+  console.error(
+    `[lemon-mcp] get_image served ${bytes.byteLength} bytes (${mimeType})`,
+  );
   return { data: Buffer.from(bytes).toString("base64"), mimeType };
+}
+
+function startsWith(bytes: Uint8Array, signature: number[]): boolean {
+  return signature.every((value, index) => bytes[index] === value);
+}
+
+/** Reject HTML error bodies and truncated payloads mislabeled as images. */
+export function hasImageSignature(bytes: Uint8Array, mimeType: string): boolean {
+  if (mimeType === "image/png") {
+    return startsWith(bytes, [137, 80, 78, 71, 13, 10, 26, 10]);
+  }
+  if (mimeType === "image/jpeg" || mimeType === "image/jpg") {
+    return startsWith(bytes, [0xff, 0xd8, 0xff]);
+  }
+  if (mimeType === "image/gif") {
+    return new TextDecoder().decode(bytes.subarray(0, 6)) === "GIF87a" ||
+      new TextDecoder().decode(bytes.subarray(0, 6)) === "GIF89a";
+  }
+  if (mimeType === "image/webp") {
+    return new TextDecoder().decode(bytes.subarray(0, 4)) === "RIFF" &&
+      new TextDecoder().decode(bytes.subarray(8, 12)) === "WEBP";
+  }
+  if (mimeType === "image/bmp") return startsWith(bytes, [0x42, 0x4d]);
+  if (mimeType === "image/tiff") {
+    return startsWith(bytes, [0x49, 0x49, 0x2a, 0x00]) ||
+      startsWith(bytes, [0x4d, 0x4d, 0x00, 0x2a]);
+  }
+  if (mimeType === "image/svg+xml") {
+    const prefix = new TextDecoder().decode(bytes.subarray(0, 1024));
+    return /<svg(?:\s|>)/i.test(prefix);
+  }
+  // ICO and ISO-BMFF (AVIF/HEIF) are uncommon here but valid MCP images.
+  if (mimeType === "image/x-icon" || mimeType === "image/vnd.microsoft.icon") {
+    return startsWith(bytes, [0x00, 0x00, 0x01, 0x00]);
+  }
+  if (mimeType === "image/avif" || mimeType === "image/heif") {
+    return new TextDecoder().decode(bytes.subarray(4, 8)) === "ftyp";
+  }
+  return bytes.byteLength > 0;
 }
