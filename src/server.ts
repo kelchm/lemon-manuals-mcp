@@ -1,7 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { VehicleIndex } from "./vehicles.js";
-import { fetchPage } from "./page.js";
+import {
+  DEFAULT_MAX_BYTES,
+  fetchResolvedPage,
+  TRUNCATION_MARKER,
+} from "./page.js";
+
+const MIN_MAX_BYTES = new TextEncoder().encode(`\n\n${TRUNCATION_MARKER}`).length;
 
 export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
   const server = new McpServer({ name: "lemon-manuals", version: "0.1.0" });
@@ -25,7 +31,8 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       description:
         "Find vehicles by free-text query over make, model, engine/trim, and year " +
         "(e.g. '2019 civic', 'miata 1994', 'f-150 5.0L 2021'). Every word must match. " +
-        "Returns manual root paths for use with get_page.",
+        "Returns one result per manual with its collapsed variants and a root path for get_page. " +
+        "Every path is an opaque encoded token: pass it exactly as returned and never decode it.",
       inputSchema: {
         query: z.string().describe("words to match, order-independent"),
         limit: z.number().int().min(1).max(100).default(20),
@@ -53,15 +60,30 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       description:
         "Fetch a manual page or directory listing by site path and return it as markdown. " +
         "Start from a search_vehicles uriPath; directory pages list child links to follow. " +
-        "Under a vehicle root, 'Repair and Diagnosis/' holds the manual tree and 'Labor Times/' the labor estimates.",
+        "Under a vehicle root, 'Repair and Diagnosis/' holds the manual tree and 'Labor Times/' the labor estimates. " +
+        "Paths are opaque encoded tokens: pass them exactly as returned and never decode them.",
       inputSchema: {
         path: z
           .string()
-          .describe("site path, e.g. /Honda/2025/Accord%20Hybrid%20EX-L/"),
+          .describe(
+            "opaque encoded site path; pass exactly as returned, never decode",
+          ),
+        depth: z
+          .number()
+          .int()
+          .min(1)
+          .default(1)
+          .describe("directory-tree levels to include"),
+        max_bytes: z
+          .number()
+          .int()
+          .min(MIN_MAX_BYTES)
+          .default(DEFAULT_MAX_BYTES)
+          .describe("maximum UTF-8 bytes returned before truncation"),
       },
     },
-    async ({ path }) => {
-      const page = await fetchPage(baseUrl, path);
+    async ({ path, depth, max_bytes }) => {
+      const page = await fetchResolvedPage(baseUrl, path, depth, max_bytes);
       return { content: [{ type: "text", text: page.markdown }] };
     },
   );
