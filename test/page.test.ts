@@ -10,7 +10,12 @@ import {
 } from "../src/page.js";
 
 const requestedPaths: string[] = [];
+const validPng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
 const largeImage = new Uint8Array(MAX_IMAGE_BYTES + 1);
+largeImage.set(validPng.subarray(0, 8));
 const originalFetch = globalThis.fetch;
 const mockFetch: typeof fetch = Object.assign(async (input: URL | RequestInfo) => {
   const url = new URL(
@@ -32,12 +37,17 @@ const mockFetch: typeof fetch = Object.assign(async (input: URL | RequestInfo) =
     );
   }
   if (url.pathname === "/image%2Fsmall.png") {
-    return new Response(new Uint8Array([137, 80, 78, 71]), {
+    return new Response(validPng, {
       headers: { "content-type": "image/png" },
     });
   }
   if (url.pathname === "/image%2Flarge.png") {
     return new Response(largeImage, {
+      headers: { "content-type": "image/png" },
+    });
+  }
+  if (url.pathname === "/image%2Fbroken.png") {
+    return new Response(new Uint8Array([137, 80, 78, 71]), {
       headers: { "content-type": "image/png" },
     });
   }
@@ -90,6 +100,7 @@ describe("page conversion", () => {
       title: "Through MY 2012",
       path: "/Volkswagen/X%2FY/",
       breadcrumb: ["System from 05.10", "Through MY 2012"],
+      childCount: 0,
     });
     expect(result.imagePaths).toEqual(["/Vehicle/images/a%2Fb.png"]);
   });
@@ -130,7 +141,7 @@ describe("page fetching", () => {
     const image = await fetchImage(baseUrl, "/image%2Fsmall.png");
     expect(image.mimeType).toBe("image/png");
     expect(Buffer.from(image.data, "base64")).toEqual(
-      Buffer.from([137, 80, 78, 71]),
+      validPng,
     );
 
     await expect(fetchImage(baseUrl, "/not-an-image")).rejects.toThrow(
@@ -138,6 +149,9 @@ describe("page fetching", () => {
     );
     await expect(fetchImage(baseUrl, "/image%2Flarge.png")).rejects.toThrow(
       `${MAX_IMAGE_BYTES + 1} bytes`,
+    );
+    await expect(fetchImage(baseUrl, "/image%2Fbroken.png")).rejects.toThrow(
+      "payload is invalid",
     );
   });
 });

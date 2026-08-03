@@ -7,12 +7,25 @@ import {
   fetchResolvedPage,
   TRUNCATION_MARKER,
 } from "./page.js";
-import { searchManual } from "./manual.js";
+import { ManualSearchIndex } from "./manual.js";
+import { errorDetail, publicMessage } from "./errors.js";
 
 const MIN_MAX_BYTES = new TextEncoder().encode(`\n\n${TRUNCATION_MARKER}`).length;
 
-export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
-  const server = new McpServer({ name: "lemon-manuals", version: "0.2.0" });
+function toolFailure(tool: string, error: unknown, fallback: string) {
+  console.error(`[lemon-mcp] ${tool} failed: ${errorDetail(error)}`);
+  return {
+    content: [{ type: "text" as const, text: publicMessage(error, fallback) }],
+    isError: true as const,
+  };
+}
+
+export function buildServer(
+  index: VehicleIndex,
+  baseUrl: string,
+  manualIndex = new ManualSearchIndex(),
+): McpServer {
+  const server = new McpServer({ name: "lemon-manuals", version: "0.3.0" });
 
   server.registerTool(
     "list_makes",
@@ -33,7 +46,8 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       description:
         "Find vehicles by free-text query over make, model, engine/trim, and year " +
         "(e.g. '2019 civic', 'miata 1994', 'f-150 5.0L 2021'). Every word must match. " +
-        "Returns one result per manual with its collapsed variants and a root path for get_page. " +
+        "Returns one result per physical drivetrain where it can be identified, preferring CHARM as the primary path. " +
+        "The databases and manuals fields identify every LEMON/CHARM source and path in the group. " +
         "Every path is an opaque encoded token: pass it exactly as returned and never decode it.",
       inputSchema: {
         query: z.string().describe("words to match, order-independent"),
@@ -62,7 +76,8 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       description:
         "Fetch a manual page or directory listing by site path and return it as markdown. " +
         "Start from a search_vehicles uriPath; directory pages list child links to follow. " +
-        "Under a vehicle root, 'Repair and Diagnosis/' holds the manual tree and 'Labor Times/' the labor estimates. " +
+        "depth defaults to 1 and listings include immediate child counts; max_bytes defaults to 40000. " +
+        "Under a vehicle root, 'Repair and Diagnosis/' holds the manual tree and 'Parts and Labor/' holds parts and labor information. " +
         "Paths are opaque encoded tokens: pass them exactly as returned and never decode them.",
       inputSchema: {
         path: z
@@ -85,8 +100,12 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       },
     },
     async ({ path, depth, max_bytes }) => {
-      const page = await fetchResolvedPage(baseUrl, path, depth, max_bytes);
-      return { content: [{ type: "text", text: page.markdown }] };
+      try {
+        const page = await fetchResolvedPage(baseUrl, path, depth, max_bytes);
+        return { content: [{ type: "text" as const, text: page.markdown }] };
+      } catch (error) {
+        return toolFailure("get_page", error, "The manual page could not be fetched.");
+      }
     },
   );
 
@@ -94,8 +113,9 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
     "search_manual",
     {
       description:
-        "Search one vehicle manual's page TITLES only, not page body text. " +
-        "Every query token must occur in a title; component codes such as J518 work because they appear in titles. " +
+        "Search one vehicle manual's titles, body text, or both using a persistent full-text index. " +
+        "mode defaults to both; every normalized query token must match. The first search of an unindexed manual may take time while its split tree and page bodies are ingested. " +
+        "Results are unique documents: duplicate placements appear in also_under, snippet is body text, and applicability labels are parsed when present. " +
         "Use a vehicle root uriPath from search_vehicles. Paths are opaque encoded tokens: " +
         "pass them exactly as returned and never decode them.",
       inputSchema: {
@@ -104,15 +124,29 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
           .describe(
             "opaque encoded vehicle root uriPath from search_vehicles; pass exactly as returned, never decode",
           ),
-        query: z.string().min(1).describe("tokens to match in page titles"),
+        query: z.string().min(1).describe("tokens to match"),
+        mode: z
+          .enum(["title", "body", "both"])
+          .default("both")
+          .describe("fields to search"),
         limit: z.number().int().min(1).max(100).default(20),
       },
     },
-    async ({ path, query, limit }) => {
-      const results = await searchManual(baseUrl, path, query, limit);
-      return {
-        content: [{ type: "text", text: JSON.stringify(results, null, 1) }],
-      };
+    async ({ path, query, mode, limit }) => {
+      try {
+        const results = await manualIndex.search(baseUrl, path, query, limit, mode);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(results, null, 1) },
+          ],
+        };
+      } catch (error) {
+        return toolFailure(
+          "search_manual",
+          error,
+          "Manual search is temporarily unavailable.",
+        );
+      }
     },
   );
 
@@ -120,7 +154,8 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
     "get_image",
     {
       description:
-        "Fetch an image from a manual Markdown image path and return an MCP image block (maximum 2 MB). " +
+        "Fetch an image path returned by get_page and return a validated MCP image block. " +
+        "Images over 2 MB are rejected explicitly and are never truncated. " +
         "Paths are opaque encoded tokens: pass them exactly as returned and never decode them.",
       inputSchema: {
         path: z
@@ -131,12 +166,20 @@ export function buildServer(index: VehicleIndex, baseUrl: string): McpServer {
       },
     },
     async ({ path }) => {
-      const image = await fetchImage(baseUrl, path);
-      return {
-        content: [
-          { type: "image", data: image.data, mimeType: image.mimeType },
-        ],
-      };
+      try {
+        const image = await fetchImage(baseUrl, path);
+        return {
+          content: [
+            {
+              type: "image" as const,
+              data: image.data,
+              mimeType: image.mimeType,
+            },
+          ],
+        };
+      } catch (error) {
+        return toolFailure("get_image", error, "The image could not be fetched.");
+      }
     },
   );
 

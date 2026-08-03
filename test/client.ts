@@ -23,6 +23,7 @@ interface ManualHit {
   title: string;
   path: string;
   snippet: string;
+  also_under: string[][];
 }
 
 function contentBlocks(result: unknown): ContentBlock[] {
@@ -115,13 +116,17 @@ try {
   const manualSearchText = firstText(
     await client.callTool({
       name: "search_manual",
-      arguments: { path: j518Root, query: "J518", limit: 20 },
+      arguments: { path: j518Root, query: "J518", mode: "title", limit: 20 },
     }),
   );
   const manualHits = JSON.parse(manualSearchText) as ManualHit[];
   assert(manualHits.length > 0, "search_manual returned no J518 titles");
   assert(manualHits.every((hit) => /j518/i.test(hit.title)));
-  assert(manualHits.every((hit) => hit.snippet.includes(hit.title)));
+  assert(manualHits.every((hit) => Array.isArray(hit.also_under)));
+  assert(
+    manualHits.every((hit) => !hit.snippet.includes(" › ")),
+    "snippet still duplicates the breadcrumb",
+  );
   console.log("search_manual J518:", manualSearchText.slice(0, 800));
 
   const firstHitPath = manualHits[0]?.path;
