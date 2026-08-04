@@ -1,7 +1,7 @@
 # lemon-manuals-mcp
 
 Prototype MCP server (streamable HTTP, stateless) for the self-hosted
-LEMON/CHARM car-repair-manual archive (`lemon.home.kelch.io`, home-lab repo
+LEMON/CHARM car-repair-manual archive (home-lab repo
 `kubernetes/apps/lemon-manuals/`).
 
 Tools:
@@ -60,12 +60,15 @@ writable and persistent if lazy indexing is enabled.
 
 ## Run / register
 
+With Bun available on `PATH`, either installed directly or through an activated
+`mise` environment:
+
 ```sh
-mise exec -- bun src/index.ts                 # HTTP server on :8787 (/mcp, /healthz)
-mise exec -- bun test/client.ts               # end-to-end smoke (needs port-forward)
-mise exec -- bun run live-corpus              # one complete manual/corpus/decade
-mise exec -- bun test                         # hermetic regression suite
-mise exec -- bun run typecheck
+bun src/index.ts                 # HTTP server on :8787 (/mcp, /healthz)
+bun test/client.ts               # end-to-end smoke (needs port-forward)
+bun run live-corpus              # one complete manual/corpus/decade
+bun test                         # hermetic regression suite
+bun run typecheck
 claude mcp add --transport http lemon-manuals http://127.0.0.1:8787/mcp
 ```
 
