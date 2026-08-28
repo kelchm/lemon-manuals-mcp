@@ -43,6 +43,15 @@ const httpServer = createServer(async (req, res) => {
     res.writeHead(404).end();
     return;
   }
+  // Stateless server: there is no server-push channel, so a standalone SSE GET
+  // stream is useless — and Bun never emits res 'close' for aborted SSE
+  // responses, so every abandoned GET stream (metamcp opens one per session)
+  // would pin its transport + McpServer forever, ~200 KB apiece. The spec
+  // allows 405 here; the SDK client treats it as "no SSE support" and moves on.
+  if (req.method === "GET") {
+    res.writeHead(405, { Allow: "POST, DELETE" }).end();
+    return;
+  }
   try {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
