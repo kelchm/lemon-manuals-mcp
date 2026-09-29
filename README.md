@@ -38,6 +38,10 @@ bun run index-manuals -- '/Volkswagen/2005/Touareg%20%287LA%29%20V8-4.2L%20%28BH
 bun run index-manuals
 ```
 
+## OCR evaluation
+
+The [bounded OCR pilot report](docs/research/ocr-pilot-2026-09-29.md) records CPU/GPU/VLM comparisons on DGX Spark and proposes a portable archive, enrichment and retrieval architecture. It includes [methodology and reproduction limits](docs/research/ocr-pilot-methodology.md), but no manual-derived images or transcripts. OCR integration and the proposed deployment options are not implemented yet.
+
 ## Setup
 
 The index files are gitignored (147MB, re-fetchable from the cluster):
