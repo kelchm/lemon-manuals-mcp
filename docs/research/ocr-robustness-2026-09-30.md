@@ -1,6 +1,6 @@
 # Automatic-region OCR robustness experiment
 
-This follow-up to the [OCR pilot](ocr-pilot-2026-09-29.md) evaluates automatic region discovery from complete images, complementary recognition and explicit uncertainty. It distinguishes candidate recall from provisionally corroborated output. [Investigation #8](https://github.com/kelchm/lemon-manuals-mcp/issues/8) tracks acceptance. All inference and source-level review artifacts remain local; this document publishes aggregate evidence only.
+This follow-up to the [OCR pilot](ocr-pilot-2026-09-29.md) evaluates automatic region discovery from complete images, complementary recognition and explicit uncertainty. It distinguishes candidate recall from provisionally corroborated output. [Investigation #8](https://github.com/kelchm/lemon-manuals-mcp/issues/8) records the completed bounded evaluation; [follow-up #9](https://github.com/kelchm/lemon-manuals-mcp/issues/9) tracks independent validation of the next region policy. All inference and source-level review artifacts remain local; this document publishes aggregate evidence only.
 
 ## Scope and scoring
 
@@ -73,10 +73,37 @@ These four timed phases totaled 31.3 minutes. Timing includes model startup, ima
 
 ## Acceptance boundary
 
-The private offline review queue contains 50 regions: 20 disagreements, 16 apparently corroborated readings, ten cases with an empty prediction from at least one model, and four reference/orientation checks. Crop outlines expose clipping, full source images provide context, and OCR suggestions remain hidden until the reviewer chooses to reveal them. Answers export with source-region identities and an analysis fingerprint. This targeted diagnostic queue is not an unbiased precision sample. Export/import and browser persistence were checked with temporary test answers, then reset; human adjudication remains pending.
+The private offline review queue contains 50 regions: 20 unresolved candidates, 16 apparently corroborated readings, ten cases with an empty prediction from at least one model, and four reference/orientation checks. Crop outlines expose clipping, full source images provide context, and OCR suggestions remain hidden until the reviewer chooses to reveal them. Answers export with source-region identities and an analysis fingerprint. This targeted diagnostic queue is not an unbiased precision sample. Export/import and browser persistence were checked with temporary test answers, then reset.
+
+## Completed human review
+
+The user completed all 50 cases on September 30. The export's analysis fingerprint, case identities and source boxes match the frozen queue. Its original bytes are retained privately and unchanged; source-checked adjudications are separate records. Suggestions were never revealed in 45 cases and revealed in five. The export does not record reveal timing, so those five cannot be described as fully blinded.
+
+| Review bucket | Clear text | No readable text | Ambiguous | Needs context |
+|---|---:|---:|---:|---:|
+| Unresolved candidates | 8 | 7 | 5 | 0 |
+| Corroborated candidates | 16 | 0 | 0 | 0 |
+| At least one empty prediction | 0 | 9 | 0 | 1 |
+| Reference/orientation checks | 4 | 0 | 0 | 0 |
+
+Fourteen of the 16 corroborated strings exactly match the raw human transcription after the existing Unicode/whitespace normalization. Source inspection reconciled the other two as a punctuation omission and a typing discrepancy in the review. This supports their literal crop readings, **not completeness or end-to-end precision**: the known identifier fragment was legible inside its crop, while the full source shows the identifier continues beyond that boundary.
+
+All 16 crops marked as containing no readable text were already unresolved by the corroboration rule. Paddle produced nonempty output on 14 of them and GLM on seven. These are targeted diagnostic counts, not model false-positive rates on the archive. Notes identify cut characters, oversized boxes containing diagram shapes, and a crop combining two rotated labels. A single serialized string cannot establish separate labels' locations or reading order.
+
+The user resolved the disputed circuit reference in favor of the alternative reading; both classical and VLM candidate sets contain that reading in the source region, but the corroboration rule does not select it. The two letter/digit identifier references were confirmed, with suggestions revealed for one of those cases. Their readings remain missing from the automatic candidate sets in this run. Frozen reference files, baseline denominators and the earlier metrics remain unchanged; these resolutions are versioned post-review evidence. This 50-case diagnostic review does not adjudicate every one of the separate 107 held-out reference targets.
+
+## Containment safeguard replay
+
+Inspection of the fragment failure found that the complete containing identifier was already supported by both classical families in the retained observations. Grouping had separated its shorter fragment and allowed corroboration without consulting that surrounding evidence.
+
+A local post-review replay adds a narrow review flag: a corroborated alphanumeric string is a possible fragment when at least 90% of its box lies in a box at least 1.25 times larger, and that containing box has a longer alphanumeric reading containing the shorter string, supported by two distinct classical families at score ≥0.8. It retains both readings and requests review; it does not silently replace a fragment with the longer text. Whole words within a multiword phrase, neighboring nonoverlapping labels, single-family evidence and letter/digit substitutions do not satisfy this rule.
+
+The replay flags 73 of the 3,422 previously corroborated candidates, including the known incomplete identifier. It leaves 3,349 provisionally corroborated candidates. Selected-anchor coverage is unchanged at 87/107 held-out and 137/165 development targets; among the 16 reviewed corroborated cases, only the known fragment is flagged. These are results on the already-inspected corpus, not independent validation. The other 72 flags are not asserted to be errors, and the guard does not solve all clipping, shape hallucination, multi-label or orientation problems. No new inference or Spark workload was run for this replay.
+
+## Next acceptance gate
 
 Near-perfect trusted extraction requires independently adjudicated predictions, including agreements and no-text regions, plus explicit abstention where evidence is ambiguous. It also requires measuring missed regions and unresolved coverage, not merely whether expected tokens appear somewhere. The current experiment does not establish calibrated confidence, complete-page accuracy, wiring relationships, archive-wide performance or safe unattended coexistence with GLM. GPU follow-up remains an idle-window workload. Retrieval integration and its own acceptance tests remain separate work in [issue #7](https://github.com/kelchm/lemon-manuals-mcp/issues/7).
 
-**Decision:** continue the bounded investigation with human adjudication and crop/orientation safeguards; do not promote the current corroboration rule into trusted unattended extraction. Multi-view classical OCR materially improved candidate recall in this selected set, while the additional recognizers exposed a selection problem that agreement alone did not solve. Preserve the frozen results as the baseline for the next iteration and evaluate any changed policy on new, independently reviewed examples.
+**Decision:** the bounded investigation supports multi-view candidate discovery and explicit abstention, but does not support trusted unattended extraction. Human review identifies region completeness, non-text rejection, separate label localization and local orientation as the next quality gates. The containment replay is a useful first guard, with independent validation still required. Preserve the frozen results and evaluate the next policy on new examples before any archive-wide run.
 
-Twelve focused geometry/reconciliation tests passed. The review interface's source display, export, import and persistence were checked; test answers were cleared. Final checks found no running containers, GPU processes or pilot processes on either Spark, and the temporary local review server was stopped. No MCP implementation, merge or deployment was performed.
+Twelve focused geometry/reconciliation tests passed for the original experiment. Ten additional synthetic checks cover review-export validation and the containment guard, including source mismatch, incomplete review, immutable answers, neighboring labels, word boundaries and lookalikes. The review interface's source display, export, import and persistence were checked; test answers were cleared before the user's review. Final experiment checks found no running containers, GPU processes or pilot processes on either Spark, and the temporary local review server was stopped. The review follow-up required no Spark access. No MCP implementation, merge or deployment was performed.
