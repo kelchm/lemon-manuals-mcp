@@ -42,6 +42,8 @@ bun run index-manuals
 
 The [bounded OCR pilot report](docs/research/ocr-pilot-2026-09-29.md) records CPU/GPU/VLM comparisons on DGX Spark and proposes a portable archive, enrichment and retrieval architecture. It includes [methodology and reproduction limits](docs/research/ocr-pilot-methodology.md), but no manual-derived images or transcripts. OCR integration and the proposed deployment options are not implemented yet.
 
+The [fresh-image source-span evaluation](docs/research/ocr-region-policy-2026-09-30.md) compares crop-boundary safeguards and local orientation with the frozen OCR baseline, keeping candidate recall, provisional selection and human acceptance separate.
+
 ## Setup
 
 The index files are gitignored (147MB, re-fetchable from the cluster):
