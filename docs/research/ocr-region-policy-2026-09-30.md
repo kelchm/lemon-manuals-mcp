@@ -2,7 +2,7 @@
 
 This comparison follows the [automatic-region experiment](ocr-robustness-2026-09-30.md) and is tracked in [investigation #9](https://github.com/kelchm/lemon-manuals-mcp/issues/9). It tests whether explicit source-span checks, separate labels and local orientation can improve provisional OCR selection. Source images, transcripts, references and review galleries remain private. Only methods and aggregate evidence belong in this report.
 
-**Decision:** reject the combined revised policy. Its blanket crop-edge veto excludes intact labels and reduces selected-anchor coverage from 53/69 to 1/69. Retain containment conflicts as explicit review evidence: a separate component diagnostic flags 41 baseline readings without losing any of the 53 selected targets, and source inspection finds fresh incomplete spans among those flags. This supports further validation of that narrow check, not trusted unattended extraction.
+**Decision:** reject the combined revised policy, which reduces selected-anchor coverage from 53/69 to 1/69. A post-hoc ablation removing only the crop-edge veto recovers 42/69; source inspection confirms that the veto excludes intact labels, but it does not explain the full baseline-to-revised loss. Retain containment conflicts as explicit review evidence: a separate component diagnostic flags 41 baseline readings without losing any of the 53 selected targets, and source inspection finds fresh incomplete spans among those flags. This supports further validation of that narrow check, not trusted unattended extraction.
 
 ## Frozen comparison
 
